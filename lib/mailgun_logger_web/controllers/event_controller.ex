@@ -25,17 +25,26 @@ defmodule MailgunLoggerWeb.EventController do
   end
 
   def stored_message(conn, %{"id" => event_id}) do
-    event = Events.get_event(event_id)
+    case Events.get_event(event_id) do
+      nil ->
+        send_resp(conn, 404, "Event not found")
 
-    if event.has_stored_message do
-      content = Mailgun.Events.get_stored_message_content(event)
-      content = String.replace(content, "bgcolor", "_bgcolor")
+      %{has_stored_message: true} = event ->
+        case Mailgun.Events.get_stored_message_content(event) do
+          content when is_binary(content) ->
+            conn
+            |> put_layout(false)
+            |> render(:stored_message, html: String.replace(content, "bgcolor", "_bgcolor"))
 
-      conn
-      |> put_layout(false)
-      |> render(:stored_message, html: content)
-    else
-      redirect(conn, to: Routes.event_path(conn, :index))
+          {:error, :not_found} ->
+            send_resp(conn, 404, "Archived message not found")
+
+          {:error, _} ->
+            send_resp(conn, 503, "Archived message is temporarily unavailable")
+        end
+
+      _event ->
+        redirect(conn, to: Routes.event_path(conn, :index))
     end
   end
 end

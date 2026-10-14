@@ -6,7 +6,7 @@ defmodule Mailgun.Events do
   alias Mailgun.Client
   alias MailgunLogger.Event
   alias MailgunLogger.Events
-  alias ExAws.S3
+  alias MailgunLogger.Storage
 
   require Logger
 
@@ -33,66 +33,76 @@ defmodule Mailgun.Events do
     |> List.flatten()
   end
 
-  @doc "Retrieve the actual sent message"
+  @doc "Retrieve and archive a message only when message storage is enabled."
   def get_stored_message(client, %Event{raw: raw} = event) do
-    case get_in(raw, ["storage", "url"]) do
-      nil ->
-        event
+    if Application.get_env(:mailgun_logger, :store_messages, false) do
+      case get_in(raw || %{}, ["storage", "url"]) do
+        nil ->
+          event
 
-      url ->
-        url = build_stored_message_url(client, url)
-        stored_message = Client.get(client, url)
-
-        if Application.get_env(:mailgun_logger, :store_messages) do
-          save_stored_message(event.api_id, stored_message)
-        end
-
-        case Events.has_stored_message(event) do
-          {:ok, event} -> event
-          _ -> event
-        end
+        url ->
+          message = Client.get(client, build_stored_message_url(client, url))
+          archive_message(event, message)
+      end
+    else
+      event
     end
   end
 
-  # Store on S3
-  defp save_stored_message(api_id, stored_message) do
-    case bucket()
-         |> S3.put_object(file_path(api_id), Jason.encode!(stored_message))
-         |> ExAws.request() do
-      {:ok, _} ->
-        :ok
+  @doc false
+  def archive_message(%Event{} = event, message) do
+    if Application.get_env(:mailgun_logger, :store_messages, false) do
+      case Storage.put_message(event.api_id, message) do
+        :ok ->
+          case Events.has_stored_message(event) do
+            {:ok, updated} ->
+              updated
 
-      {:error, reason} ->
-        Logger.error("Failed to save stored message #{api_id} to S3: #{inspect(reason)}")
-        :error
+            {:error, _} ->
+              Logger.error("Message archived but event flag update failed for event #{event.id}")
+              event
+          end
+
+        {:error, _} ->
+          Logger.error("Failed to archive message for event #{event.id}")
+          event
+      end
+    else
+      event
     end
   end
 
+  @doc "Return the archived message map, or an error tuple if unavailable."
   def get_stored_message(event) do
-    bucket = bucket()
-
-    ExAws.S3.download_file(bucket, file_path(event), :memory)
-    |> ExAws.stream!()
-    |> Enum.join("")
-    |> Jason.decode!()
+    case Storage.get_message(event) do
+      {:ok, message} -> message
+      {:error, _} = error -> error
+    end
   end
 
   def get_stored_message_content(event) do
-    msg = get_stored_message(event)
-    content_type = Map.get(msg, "Content-Type", "")
+    case get_stored_message(event) do
+      {:error, _} = error ->
+        error
 
-    if String.contains?(content_type, "text/plain") do
-      Map.get(msg, "body-plain", "")
-    else
-      Map.get(msg, "body-html", "")
+      message when is_map(message) ->
+        content_type = Map.get(message, "Content-Type", "")
+
+        if is_binary(content_type) do
+          field = if String.contains?(content_type, "text/plain"), do: "body-plain", else: "body-html"
+          content = Map.get(message, field, "")
+          if is_binary(content), do: content, else: {:error, :invalid_message}
+        else
+          {:error, :invalid_message}
+        end
     end
   end
 
-  def file_path(%{api_id: api_id}), do: file_path(api_id)
-  def file_path(api_id), do: Path.join(base_dir(), file_name(api_id))
-  def file_name(api_id), do: "#{api_id}.json"
-  def base_dir(), do: Application.get_env(:ex_aws, :raw_path)
-  def bucket(), do: Application.get_env(:ex_aws, :bucket)
+  # Preserve the existing public helpers for S3 object keys.
+  defdelegate file_path(event_or_id), to: MailgunLogger.Storage.S3
+  defdelegate file_name(api_id), to: MailgunLogger.Storage.S3
+  defdelegate base_dir(), to: MailgunLogger.Storage.S3
+  defdelegate bucket(), to: MailgunLogger.Storage.S3
 
   defp build_stored_message_url(client, "https://" <> r), do: "https://api:#{client.api_key}@#{r}"
   defp build_stored_message_url(_, url), do: url

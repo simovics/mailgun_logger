@@ -1,7 +1,16 @@
 import Config
 
+storage_backend =
+  case System.get_env("ML_STORAGE_BACKEND", "s3") do
+    "s3" -> MailgunLogger.Storage.S3
+    "filesystem" -> MailgunLogger.Storage.Filesystem
+    other -> raise ArgumentError, "Unsupported ML_STORAGE_BACKEND: #{inspect(other)}"
+  end
+
 config :mailgun_logger,
-  store_messages: System.get_env("ML_STORE_MESSAGES", "false") |> String.downcase() == "true"
+  store_messages: System.get_env("ML_STORE_MESSAGES", "false") |> String.downcase() == "true",
+  storage_backend: storage_backend,
+  storage_path: System.get_env("ML_STORAGE_PATH", "/data/messages")
 
 config :mailgun_logger, MailgunLoggerWeb.Endpoint,
   server: true,
